@@ -1,0 +1,468 @@
+# ----------------------------------------------------------------------------#
+# Imports
+# ----------------------------------------------------------------------------#
+import config
+import json
+import dateutil.parser
+import babel
+from flask import Flask, render_template, request, Response, flash, redirect, url_for
+from flask_moment import Moment
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+import logging
+from logging import Formatter, FileHandler
+from flask_wtf.csrf import CSRFProtect
+from flask_wtf import FlaskForm
+from forms import *
+from sqlalchemy.sql import func
+from datetime import datetime
+
+from models import Venue, Artist, Show, db
+
+# ----------------------------------------------------------------------------#
+# App Config.
+# ----------------------------------------------------------------------------#
+
+app = Flask(__name__)
+moment = Moment(app)
+app.config.from_object("config")
+db.init_app(app)
+migrate = Migrate(app, db, compare_type=True)
+migrate.init_app(app)
+app.secret_key = b"_53oi3uriq9pifpff;apl"
+csrf = CSRFProtect(app)
+# TODO: connect to a local postgresql database
+
+
+def format_datetime(value, format="medium"):
+    date = dateutil.parser.parse(value)
+    if format == "full":
+        format = "EEEE MMMM, d, y 'at' h:mma"
+    elif format == "medium":
+        format = "EE MM, dd, y h:mma"
+    return babel.dates.format_datetime(date, format, locale="en")
+
+
+app.jinja_env.filters["datetime"] = format_datetime
+
+# ----------------------------------------------------------------------------#
+# Controllers.
+# ----------------------------------------------------------------------------#
+
+
+@app.route("/")
+def index():
+    return render_template("pages/home.html")
+
+
+#  Venues
+#  ----------------------------------------------------------------
+
+
+@app.route("/venues")
+def venues():
+    data = []
+    areas = Venue.query.distinct("city", "state").all()
+
+    today = datetime.now()
+    today = today.strftime("%Y-%m-%d")
+
+    def get_venue(venue):
+        venue_id = venue.id
+        upcoming_shows = (
+            db.session.query(Show)
+            .join(Artist)
+            .filter(Show.venue_id == venue_id)
+            .filter(Show.start_time > today)
+            .all()
+        )
+
+        upcoming_shows_count = 0
+        for show in upcoming_shows:
+            upcoming_shows_count = upcoming_shows_count + 1
+        return {
+            "id": venue_id,
+            "name": venue.name,
+            "num_upcoming_shows": upcoming_shows_count,
+        }
+
+    for area in areas:
+        venues = Venue.query.filter(
+            Venue.city == area.city, Venue.state == area.state
+        ).all()
+        record = {
+            "city": area.city,
+            "state": area.state,
+            "venues": [get_venue(venue) for venue in venues],
+        }
+        data.append(record)
+
+    return render_template("pages/venues.html", areas=data)
+
+
+@app.route("/venues/search", methods=["POST"])
+def search_venues():
+    # TODO: implement search on artists with partial string search. Ensure it is case-insensitive.
+    # seach for Hop should return "The Musical Hop".
+    # search for "Music" should return "The Musical Hop" and "Park Square Live Music & Coffee"
+    search_term = request.form.get("search_term")
+    search_results = Venue.query.filter(Venue.name.ilike(f"%{search_term}%")).all()
+    count_results = len(search_results)
+    response = {}
+    data = []
+
+    today = datetime.now()
+    today = today.strftime("%Y-%m-%d")
+
+    def get_upcoming_number(venue_id):
+        total = (
+            db.session.query(Show)
+            .join(Artist)
+            .filter(Show.venue_id == venue_id)
+            .filter(Show.start_time > today)
+            .all()
+        )
+        return len(total)
+
+    for result in search_results:
+        data.append(
+            {
+                "id": result.id,
+                "name": result.name,
+                "num_upcoming_shows": get_upcoming_number(result.id),
+            }
+        )
+    response["count"] = count_results
+    response["data"] = data
+
+    return render_template(
+        "pages/search_venues.html", results=response, search_term=search_term
+    )
+
+
+@app.route("/venues/<int:venue_id>")
+def show_venue(venue_id):
+    venue = Venue.query.get(venue_id)
+    arr = venue.genres[1:-1]
+    arr = "".join(arr).split(",")
+    venue.genres = arr
+    today = datetime.now()
+    today = today.strftime("%Y-%m-%d")
+    if venue.seeking_description:
+        venue.seeking_text = "We are on the lookout for a local artist to play every two weeks. Please call us."
+
+    # Query upcoming and past shows
+    upcoming_shows = (
+        db.session.query(Show)
+        .join(Artist)
+        .filter(Show.venue_id == venue_id)
+        .filter(Show.start_time > today)
+        .all()
+    )
+    past_shows = (
+        db.session.query(Show)
+        .join(Artist)
+        .filter(Show.venue_id == venue_id)
+        .filter(Show.start_time < today)
+        .all()
+    )
+
+    # Function to get filtered shows data for display, past or upcoming
+    def shows(shows):
+        show_render_data = []
+        shows_count = 0
+        for show in shows:
+            shows_count = shows_count + 1
+            show_render_data.append(
+                {
+                    "start_time": show.start_time,
+                    "artist_id": show.artist_id,
+                    "artist_image_link": show.artist.image_link,
+                    "artist_name": show.artist.name,
+                }
+            )
+        return [shows_count, show_render_data]
+
+    past_shows = shows(past_shows)
+    upcoming_shows = shows(upcoming_shows)
+
+    venue.past_shows_count = past_shows[0]
+    venue.past_shows = past_shows[1]
+
+    venue.upcoming_shows_count = upcoming_shows[0]
+    venue.upcoming_shows = upcoming_shows[1]
+
+    return render_template("pages/show_venue.html", venue=venue)
+
+
+#  Create Venue
+#  ----------------------------------------------------------------
+
+
+@app.route("/venues/create", methods=["GET"])
+def create_venue_form():
+    form = VenueForm()
+    return render_template("forms/new_venue.html", form=form)
+
+
+@app.route("/venues/create", methods=["POST"])
+def create_venue_submission():
+    form = VenueForm(request.form, meta={"csrf": False})
+    if form.validate():
+        venue = Venue(
+            name=form.name.data,
+            city=form.city.data,
+            state=form.state.data,
+            phone=form.phone.data,
+            address=form.address.data,
+            genres=form.genres.data,
+            image_link=form.image_link.data,
+            facebook_link=form.facebook_link.data,
+            website_link=form.website_link.data,
+            seeking_description=form.seeking_description.data,
+            seeking_talent=form.seeking_talent.data,
+        )
+        db.session.add(venue)
+        db.session.commit()
+        flash("Venue " + form.name.data + " was successfully listed!")
+        return render_template("pages/home.html")
+    else:
+        flash(
+            "An error occured. Venue "
+            + form.name.data
+            + " could not be listed. Please correct submission."
+        )
+        return render_template("forms/new_venue.html", form=form)
+
+
+#  Artists
+#  ----------------------------------------------------------------
+@app.route("/artists")
+def artists():
+    data = Artist.query.all()
+    return render_template("pages/artists.html", artists=data)
+
+
+@app.route("/artists/search", methods=["POST"])
+def search_artists():
+    search_term = request.form.get("search_term")
+    search_results = Artist.query.filter(Artist.name.ilike(f"%{search_term}%")).all()
+    count_results = len(search_results)
+    response = {}
+    data = []
+
+    today = datetime.now()
+    today = today.strftime("%Y-%m-%d")
+
+    def get_upcoming_number(artist_id):
+        total = (
+            db.session.query(Show)
+            .join(Venue)
+            .filter(Show.artist_id == artist_id)
+            .filter(Show.start_time > today)
+            .all()
+        )
+        return len(total)
+
+    for result in search_results:
+        data.append(
+            {
+                "id": result.id,
+                "name": result.name,
+                "num_upcoming_shows": get_upcoming_number(result.id),
+            }
+        )
+    response["count"] = count_results
+    response["data"] = data
+
+    return render_template(
+        "pages/search_artists.html",
+        results=response,
+        search_term=request.form.get("search_term", ""),
+    )
+
+
+@app.route("/artists/<int:artist_id>")
+def show_artist(artist_id):
+    artist = Artist.query.get(artist_id)
+    arr = artist.genres[1:-1]
+    arr = "".join(arr).split(",")
+    artist.genres = arr
+    today = datetime.now()
+    today = today.strftime("%Y-%m-%d")
+    if artist.seeking_venue:
+        artist.seeking_text = "Looking for venue to play in."
+
+    # Query upcoming and past shows
+    upcoming_shows = (
+        db.session.query(Show)
+        .join(Venue)
+        .filter(Show.artist_id == artist_id)
+        .filter(Show.start_time > today)
+        .all()
+    )
+    past_shows = (
+        db.session.query(Show)
+        .join(Venue)
+        .filter(Show.artist_id == artist_id)
+        .filter(Show.start_time < today)
+        .all()
+    )
+
+    # Function to get filtered shows data for display, past or upcoming
+    def shows(shows):
+        show_render_data = []
+        shows_count = 0
+        for show in shows:
+            shows_count = shows_count + 1
+            show_render_data.append(
+                {
+                    "start_time": show.start_time,
+                    "venue_id": show.venue_id,
+                    "venue_image_link": show.venue.image_link,
+                    "venue_name": show.venue.name,
+                }
+            )
+        return [shows_count, show_render_data]
+
+    past_shows = shows(past_shows)
+    upcoming_shows = shows(upcoming_shows)
+
+    artist.past_shows_count = past_shows[0]
+    artist.past_shows = past_shows[1]
+
+    artist.upcoming_shows_count = upcoming_shows[0]
+    artist.upcoming_shows = upcoming_shows[1]
+
+    return render_template("pages/show_artist.html", artist=artist)
+
+
+#  Create Artist
+#  ----------------------------------------------------------------
+
+
+@app.route("/artists/create", methods=["GET"])
+def create_artist_form():
+    form = ArtistForm()
+    return render_template("forms/new_artist.html", form=form)
+
+
+@app.route("/artists/create", methods=["POST"])
+def create_artist_submission():
+    # called upon submitting the new artist listing form
+    form = ArtistForm(request.form, meta={"csrf": False})
+
+    if form.validate():
+        artist = Artist(
+            name=form.name.data,
+            city=form.city.data,
+            state=form.state.data,
+            phone=form.phone.data,
+            facebook_link=form.facebook_link.data,
+            genres=form.genres.data,
+            image_link=form.image_link.data,
+            website_link=form.website_link.data,
+            seeking_venue=form.seeking_venue.data,
+            seeking_description=form.seeking_description.data,
+        )
+        db.session.add(artist)
+        db.session.commit()
+        flash("Artist " + form.name.data + " was successfully listed!")
+        return render_template("pages/home.html")
+    else:
+        flash("An error occured. Artist " + form.name.data + " could not be listed")
+        return render_template("forms/new_artist.html", form=form)
+
+
+#  Shows
+#  ----------------------------------------------------------------
+
+
+@app.route("/shows")
+def shows():
+    data = []
+    all_shows = db.session.query(Show).join(Artist).join(Venue).all()
+    for show in all_shows:
+        data.append(
+            {
+                "venue_id": show.venue_id,
+                "venue_name": show.venue.name,
+                "artist_id": show.artist_id,
+                "artist_image_link": show.artist.image_link,
+                "artist_name": show.artist.name,
+                "start_time": show.start_time,
+            }
+        )
+
+    return render_template("pages/shows.html", shows=data)
+
+
+@app.route("/shows/create")
+def create_shows():
+    # renders form. do not touch.
+    form = ShowForm()
+    return render_template("forms/new_show.html", form=form)
+
+
+@app.route("/shows/create", methods=["POST"])
+def create_show_submission():
+    try:
+        form = ShowForm()
+        if form.validate():
+            artist_id = (request.form["artist_id"],)
+            venue_id = (request.form["venue_id"],)
+            start_time = request.form["start_time"]
+            artist = Artist.query.get(artist_id)
+            venue = Venue.query.get(venue_id)
+            start_time = start_time
+
+            new_show = Show(
+                artist_id=artist_id, venue_id=venue_id, start_time=start_time
+            )
+            artist.show = [new_show]
+            venue.show = [new_show]
+            db.session.add_all([artist, venue, new_show])
+            db.session.commit()
+            flash("Show was successfully listed!")
+            return render_template("pages/home.html")
+        else:
+            flash("An error occurred. Show could not be listed.")
+            return render_template("forms/new_show.html", form=form)
+    except:
+        return render_template("errors/500.html"), 500
+
+
+@app.errorhandler(404)
+def not_found_error(error):
+    return render_template("errors/404.html"), 404
+
+
+@app.errorhandler(500)
+def server_error(error):
+    return render_template("errors/500.html"), 500
+
+
+if not app.debug:
+    file_handler = FileHandler("error.log")
+    file_handler.setFormatter(
+        Formatter("%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]")
+    )
+    app.logger.setLevel(logging.INFO)
+    file_handler.setLevel(logging.INFO)
+    app.logger.addHandler(file_handler)
+    app.logger.info("errors")
+
+# ----------------------------------------------------------------------------#
+# Launch.
+# ----------------------------------------------------------------------------#
+
+# Default port:
+if __name__ == "__main__":
+    app.run()
+
+# Or specify port manually:
+"""
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
+"""
